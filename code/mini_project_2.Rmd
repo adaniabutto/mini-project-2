@@ -31,11 +31,9 @@ library(patchwork)
 library(scales)
 library(lme4)          # for mixed effects models
 library(ggeffects)
-library(patchwork)
 library(broom.mixed)
 library(emmeans)
 library(generics)
-library(modelr)
 library(tidyverse)     # for everything else
 
 ## set default code chunk options
@@ -49,8 +47,6 @@ options(width = 70)
 
 ## suppress warnings about grouping 
 options(dplyr.summarise.inform = F)
-options(xtable.floating = F)
-options(xtable.timestamp = "")
 
 ## set random seed
 set.seed(1)
@@ -415,9 +411,10 @@ ggsave((paste0(figures_dir,
 
 # Phase 2: Defining & evaluating statistical models
 
-Next, we examine what predicts average student performance across chapters.
+Next, we examine what predicts average student performance at the individual question
+level.
 
-## RQ1: Does % correct decrease with advancement of content?
+## Model 1: Does % correct decrease with advancement of content?
 
 ```{r warning = F}
 
@@ -477,7 +474,7 @@ lm.model1 %>%
 
 ```
 
-## RQ2: Does student engagement predict % correct?
+## Model 2: Does student engagement predict % correct?
 
 Including only number of attempts as an engagement predictor because the model does not
 converge using the other predictors.
@@ -523,13 +520,15 @@ lm.model2 %>%
 
 ```
 
+## Viz 3: Model 2 Predictions
+
 ```{r}
 
 # plot
 plot.model2 =
   lm.model2 %>%
-  ggpredict(terms = c("chapter [1:9]",  # x‑axis
-                      "attempt [1, 2, 5]",     # colour / linetype
+  ggpredict(terms = c("chapter [1:9]",
+                      "attempt [1, 2, 5]",
                       "book"),
             ci_level = NA,
             bias_correction = TRUE) |>
@@ -554,7 +553,7 @@ ggsave((paste0(figures_dir,
 
 ```
 
-## RQ3: Does % correct on previous chapter predict % correct on current chapter?
+## Model 3: Does % correct on previous chapter predict % correct on current chapter?
 
 ```{r}
 
@@ -596,7 +595,7 @@ lm.model3 %>%
 
 ```
 
-## Combined Model
+## Model 4: Combined Model
 
 ```{r}
 
@@ -635,7 +634,7 @@ lm.model4 %>%
 
 ```
 
-### Comparison
+## Model Comparison
 
 ```{r}
 
@@ -673,7 +672,7 @@ df.metrics =
   arrange(AIC) %>%
   mutate(across(where(is.numeric), round, digits = 5))
 
-View(df.metrics)
+print(df.metrics)
 
 ```
 
@@ -685,82 +684,47 @@ new items).
 
 ```{r}
 
-# # Import held out data
-# df.heldout =
-#   read.csv(paste0(data_dir, "filtered20_responses_2023.csv"))
-# 
-# df.heldout =
-#   df.heldout %>%
-#   group_by(book, release,
-#            institution_id, class_id,
-#            student_id,
-#            chapter_num,
-#            item_id) %>%
-#   # count only last attempt
-#   slice_max(order_by = attempt,
-#             n = 1,
-#             with_ties = F) %>% 
-#   ungroup() %>%
-#   # keep only relevant cols
-#   select(c(book, release,
-#            institution_id, class_id,
-#            student_id,
-#            chapter = chapter_num, item_id,
-#            points_possible, points_earned, attempt))
-# 
-# # compute engagement
-# df.summary_heldout =
-#   df.heldout %>%
-#   # group % correct by book, release, institution, class, student, and chapter
-#   group_by(book, release,
-#            institution_id, class_id, student_id,
-#            chapter) %>%
-#   # calculate % correct across chapter
-#   summarise(score = mean(points_earned, na.rm = T),
-#             # calculate average number of attempts across chapter
-#             no_attempts = mean(attempt, na.rm = T),
-#             .groups = "drop_last") %>%
-#   arrange(book, release,
-#           institution_id, class_id, student_id,
-#           chapter) %>% 
-#   group_by(book, release, institution_id, class_id, student_id) %>% 
-#   # add column for % correct on preceding chapter
-#   mutate(score_prev_chapter = lag(score)) %>%   # NA for the first chapter
-#   ungroup()
-# 
-# df.heldout =
-#   df.heldout %>% 
-#   left_join(df.summary_heldout %>% 
-#               select(student_id, chapter, score_prev_chapter),
-#             by = c("student_id", "chapter")) %>%
-#   select(points_earned, chapter, book,
-#          attempt, score_prev_chapter,
-#          class_id, student_id) %>%
-#   mutate(across(c(class_id, book, student_id),
-#                 factor)) %>%
-#   # create binary value marking missing values for prev chapter scores
-#   mutate(prev_missing = if_else(is.na(score_prev_chapter), 1, 0),
-#          # fill first chapter values with 0
-#          score_prev_chapter = replace_na(score_prev_chapter, 0)) %>%
-#   drop_na()
+# Import held out data
+df.heldout =
+  read.csv(paste0(data_dir, "filtered20_eoc_2023.csv"))
+
+df.heldout =
+  df.heldout %>%
+  group_by(book,
+           institution_id, class_id,
+           student_id,
+           chapter) %>%
+  ungroup() %>%
+  # keep only relevant cols
+  select(c(book, release,
+           institution_id, class_id,
+           student_id,
+           chapter,
+           score)) %>%
+  mutate(across(c(class_id, student_id), factor))
 
 ```
 
 ```{r}
 
-# # predict held out students
-# df.predict =
-#   df.heldout %>% 
-#   mutate(pred = predict(lm.model4, newdata = ., type = "response",
-#                         re.form = NA, # fixed‑effects only
-#                         allow.new.levels = TRUE))
-# 
-# # aggregate to one row per student
-# df.submit =
-#   df.predict %>% 
-#   group_by(id = student_id) %>% 
-#   summarise(score = mean(pred), .groups = "drop")
-# 
-# print(df.submit)
+# predict held out students - can only use model 1 since we don't have other data
+df.predict =
+  df.heldout %>%
+  mutate(pred = predict(lm.model1, newdata = ., type = "response",
+                        re.form = NA, # fixed‑effects only
+                        allow.new.levels = TRUE))
+
+# aggregate to one row per student
+df.submit =
+  df.predict %>%
+  group_by(id = student_id, chapter) %>%
+  summarise(score = mean(pred), .groups = "drop") %>%
+  mutate(id = c((0:1182))) %>% 
+  select(id, score)
+
+print(df.submit)
+
+# export
+readr::write_csv(df.submit, paste0(data_dir, "submit.csv"))
 
 ```
