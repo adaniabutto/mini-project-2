@@ -1,0 +1,766 @@
+---
+title: "DATSCI294L: Data Science and the Science of Learning"
+subtitle: "Mini-Project #2: Predicting individual quiz performance from behavioral engagement"
+author: "Adani B. Abutto"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+
+header-includes:
+    - \usepackage{setspace}\doublespacing
+---
+
+# Setup
+
+```{r, message = F, warning = F}
+
+## load relevant libraries and functions
+require(knitr)         # for knitting
+library(Hmisc)         # for descriptives
+library(psych)
+library(png)           # for working with images
+library(grid)
+library(ggplotify)     # for plotting
+library(patchwork)
+library(scales)
+library(lme4)          # for mixed effects models
+library(ggeffects)
+library(patchwork)
+library(broom.mixed)
+library(emmeans)
+library(generics)
+library(modelr)
+library(tidyverse)     # for everything else
+
+## set default code chunk options
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+
+## set default plot theme and colors
+theme_set(theme_classic(base_size = 18))
+
+## fix print width for knitted doc
+options(width = 70)
+
+## suppress warnings about grouping 
+options(dplyr.summarise.inform = F)
+options(xtable.floating = F)
+options(xtable.timestamp = "")
+
+## set random seed
+set.seed(1)
+
+## set directories for plots and data outputs
+figures_dir = '../figures/'
+data_dir = '../data/'
+
+```
+
+# Phase 1: Exploring and visualizing the data
+
+## Load and examine the data
+
+```{r}
+
+# Import data from https://science-of-learning-datasci.s3.us-west-2.amazonaws.com/mini-project2/coursekata-23-split80.zip
+
+df.responses =
+  read.csv(paste0(data_dir,
+                  "filtered80_responses_2023.csv"))
+
+df.filtered_responses =
+  read.csv(paste0(data_dir,
+                  "filtered80_eoc_2023.csv"))
+
+# run quick data summary
+skimr::skim(df.responses)
+skimr::skim(df.filtered_responses)
+
+```
+
+## Data Wrangling
+
+```{r}
+
+df.reduced =
+  df.responses %>%
+  # calculate time spent on question (in mins)
+  mutate(dt_submitted = ymd_hms(dt_submitted),
+         lrn_dt_started = ymd_hms(lrn_dt_started),
+         time_spent = as.numeric(difftime(dt_submitted,
+                                          lrn_dt_started,
+                                          units = "mins")),
+         # make "completes_page" boolean
+         completes_page = completes_page == "true") %>% 
+  group_by(book, release,
+           institution_id, class_id, student_id,
+           chapter_num, item_id) %>%
+  # count only last attempt
+  slice_max(order_by = attempt,
+            n = 1,
+            with_ties = F) %>% 
+  ungroup() %>%
+  # keep only relevant cols
+  select(c(book, release,
+           institution_id, class_id,
+           student_id,
+           chapter = chapter_num, item_id,
+           time_spent, completes_page,
+           points_possible, points_earned, attempt))
+
+# sanity check
+df.reduced %>% 
+  count(student_id, item_id) # should all be 1
+
+# print top rows
+head(df.reduced, n = 10)
+
+```
+
+```{r}
+
+df.summary =
+  df.reduced %>%
+  # group % correct by book, release, institution, class, student, and chapter
+  group_by(book, release,
+           institution_id, class_id, student_id,
+           chapter) %>%
+  # calculate % correct across chapter
+  summarise(score = mean(points_earned, na.rm = T),
+            # calculate % of pages fully completed across chapter
+            chapter_pages_completed = mean(completes_page, na.rm = T),
+            # calculate time spent across chapter
+            time_spent = mean(time_spent, na.rm = T),
+            # calculate average number of attempts across chapter
+            no_attempts = mean(attempt, na.rm = T),
+            .groups = "drop_last") %>%
+  arrange(book, release,
+          institution_id, class_id, student_id,
+          chapter) %>% 
+  group_by(book, release, institution_id, class_id, student_id) %>% 
+  # add column for % correct on preceding chapter
+  mutate(score_prev_chapter = lag(score)) %>%   # NA for the first chapter
+  ungroup()
+
+# sanity check
+df.summary %>% 
+  count(student_id, chapter) # should all be 1
+
+# print top rows
+head(df.reduced, n = 10)
+
+```
+
+## Preliminary Item Difficulty Analysis: % correct
+
+We have a total of 9 chapters, with data from N = 570 students. Not all students answered
+all questions in all chapters, so we get a range of N = 526 to 562. The proportion of
+correct responses ranges from 71.4% to 97.8% and seems to decline with chapter number
+(i.e., more advanced chapters are harder). The SD ranges from 17% to 5%, also increasing
+with chapter number (i.e., there is more variability in more advanced chapters).
+
+```{r}
+
+# Print descriptive stats: For each chapter, compute % correct (mean), SD, and SE
+df.descriptives =
+  df.summary %>%
+  group_by(chapter) %>%
+  # compute mean
+  dplyr::summarise(mean_correct = mean(score,
+                                       na.rm = T),
+                   # compute SD
+                   sd_correct = sd(score,
+                                   na.rm = T),
+                   # compute number of responses
+                   n = n(),
+                   # compute SE (SD / sqrt of n)
+                   se_correct = sd_correct/sqrt(n)) %>%
+  ungroup()
+
+# print
+View(df.descriptives)
+
+```
+
+Below, we evaluate means and SDs by chapter [**and**]{.underline} book:
+
+```{r}
+
+# Print descriptive stats: For each chapter *and book*, compute % correct (mean), SD, and SE
+df.descriptives2 =
+  df.summary %>%
+  group_by(chapter, book) %>%
+  # compute mean
+  dplyr::summarise(mean_correct = mean(score,
+                                       na.rm = T),
+                   # compute SD
+                   sd_correct = sd(score,
+                                   na.rm = T),
+                   # compute number of responses
+                   n = n(),
+                   # compute SE (SD / sqrt of n)
+                   se_correct = sd_correct/sqrt(n)) %>%
+  ungroup()
+
+# print
+View(df.descriptives2)
+
+```
+
+### Viz 1: % correct by chapter and book
+
+There are 9 chapters and 2 book versions. The plot below shows that % correct seems to
+decline with chapter number (i.e., more advanced chapters are harder), but does not vary
+much by book. We also see increasing variance with increasing chapter number (i.e., there
+is more variability in more advanced chapters).
+
+```{r fig.width = 20, fig.height = 10}
+
+plot.pct_correct =
+  df.summary %>%
+  mutate(chapter = factor(chapter)) %>%
+  # chapter on x-axis
+  ggplot(aes(x = chapter,
+             # % correct on y-axis
+             y = (score*100),
+         # color each bar based on graph type
+         color = chapter)) +
+  # dot plot for individual participants
+  geom_point(aes(color = book),
+             position = position_jitter(width = .1,
+                                        height = 0),
+             alpha = .3,
+             size = 1) +
+  # line plot connecting dots across chapters
+  geom_line(aes(group = student_id, color = book),
+            linewidth = .2,
+            alpha = .03) +
+  # plot chapter means with 95% CIs
+  stat_summary(fun.data = mean_cl_boot,
+               geom     = "errorbar",
+               width    = 0.1,
+               linewidth = 1,
+               color    = "black") +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size  = 3,
+               color = "black") +
+  # add title and axis labels
+  labs(title = "% correct by Chapter & Book",
+       x = "Chapter",
+       y = "% correct",
+       color = "Book") +
+  theme(legend.position = "bottom")
+
+plot.pct_correct
+
+# export plot
+ggsave((paste0(figures_dir,
+               "pct_correct_bychapter.png")),
+       width = 20, height = 10, device = "png")
+
+```
+
+### Viz 2: Engagement across Chapters (Engagement over Time)
+
+We computed 3 engagement metrics: (1) how many chapter pages were fully completed in a
+given chapter, (2) how many attempts student took, on average, across questions within a
+chapter, and (3), how long students took, on average, to answer questions within a
+chapter.
+
+Not all students answered all questions in all chapters, so we get a range of N = 526 to
+562 data points.
+
+The proportion of full pages completed ranged from 12.6 to 27.6% and fluctuated across
+chapters. The first chapter had the most variance.
+
+The average amount of time spent ranged from 9 to 14.2 minutes. The SD was quite large
+(12-26 minutes).
+
+The mean number of attempts was consistently close to 1, but ranged from 1.08 to 1.23. It
+was highest for the first chapter. SDs ranged from .08 to .34.
+
+```{r}
+
+# Print descriptive stats: For each chapter, compute % correct (mean), SD, and SE
+df.descriptives_engagement =
+  df.summary %>%
+  group_by(chapter) %>%
+  dplyr::summarise(n = n(),
+                   # mean number of pages
+                   mean_pages = mean(chapter_pages_completed,
+                                     na.rm = T),
+                   # SD number of pages
+                   sd_pages = sd(chapter_pages_completed,
+                                   na.rm = T),
+                   # mean time spent
+                   mean_time = mean(time_spent,
+                                     na.rm = T),
+                   sd_time = sd(time_spent,
+                                na.rm = T),
+                   # SD time spent
+                   sd_pages = sd(time_spent,
+                                 na.rm = T),
+                                      # mean time spent
+                   mean_attempts = mean(no_attempts,
+                                            na.rm = T),
+                   # SD time spent
+                   sd_attempts = sd(no_attempts,
+                                    na.rm = T)) %>%
+  ungroup()
+
+# print
+View(df.descriptives_engagement)
+
+```
+
+The figure below visualizes this:
+
+```{r fig.width = 25, fig.height = 10}
+
+# no of pages completed within chapter
+plot.pages =
+  df.summary %>%
+  ggplot(aes(x = factor(chapter),
+             y = (chapter_pages_completed*100))) +
+  # plot chapter means with 95% CIs
+  stat_summary(fun.data = mean_cl_boot,
+               geom     = "errorbar",
+               width    = 0.1,
+               linewidth = 1,
+               color    = "black") +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size  = 3,
+               color = "black") +
+  # dot plot for individual participants
+  geom_point(position = position_jitter(width = .3,
+                                        height = 0),
+             alpha = .1,
+             size = .5,
+             color = "purple") +
+  labs(x = "Chapter", y = "Mean % of chapter pages fully completed",
+       title = "Average # of pages completed within chapter")
+
+# average no of attempts across questions within chapter
+plot.attempts =
+  df.summary %>%
+  ggplot(aes(x = factor(chapter),
+             y = no_attempts)) +
+  # plot chapter means with 95% CIs
+  stat_summary(fun.data = mean_cl_boot,
+               geom     = "errorbar",
+               width    = 0.1,
+               linewidth = 1,
+               color    = "black") +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size  = 3,
+               color = "black") +
+  # dot plot for individual participants
+  geom_point(position = position_jitter(width = .3,
+                                        height = 0),
+             alpha = .1,
+             size = .5,
+             color = "purple") +
+  labs(x = "Chapter", y = "Mean # of attempts across questions",
+       title = "Average # of attempts across questions within chapter")
+
+# avreage time spent across questions within chapter
+plot.time =
+  df.summary %>%
+  ggplot(aes(x = factor(chapter),
+             y = time_spent)) +
+  # plot chapter means with 95% CIs
+  stat_summary(fun.data = mean_cl_boot,
+               geom     = "errorbar",
+               width    = 0.1,
+               linewidth = 1,
+               color    = "black") +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size  = 3,
+               color = "black") +
+  # dot plot for individual participants
+  geom_point(position = position_jitter(width = .3,
+                                        height = 0),
+             alpha = .1,
+             size = .5,
+             color = "purple") +
+  labs(x = "Chapter", y = "Mean time spent across questions (mins)",
+       title = "Mean time spent across questions within chapter")
+
+# combine plots
+plot.engagement =
+  plot.pages + plot.attempts + plot.time +
+  plot_layout(guides = "collect")
+
+plot.engagement
+
+# export plot
+ggsave((paste0(figures_dir,
+               "engagement_bychapter.png")),
+       width = 25, height = 10, device = "png")
+
+```
+
+# Phase 2: Defining & evaluating statistical models
+
+Next, we examine what predicts average student performance across chapters.
+
+## RQ1: Does % correct decrease with advancement of content?
+
+```{r warning = F}
+
+# create new df
+df.compare =
+  df.reduced %>% 
+  left_join(df.summary %>% 
+              select(student_id, chapter, score_prev_chapter),
+            by = c("student_id", "chapter")) %>%
+  select(points_earned, chapter, book,
+         attempt, score_prev_chapter,
+         class_id, student_id) %>%
+  mutate(across(c(class_id, book, student_id),
+                factor)) %>%
+  # create binary value marking missing values for prev chapter scores
+  mutate(prev_missing = if_else(is.na(score_prev_chapter), 1, 0),
+         # fill first chapter values with 0
+         score_prev_chapter = replace_na(score_prev_chapter, 0)) %>%
+  drop_na()
+
+```
+
+```{r}
+
+# quick check of correlation
+df.summary %>% 
+  summarise(r = cor(score, chapter, use = "pair"))
+
+# mixed effects model
+lm.model1 =
+  glmer(points_earned ~
+          1 +
+          # fixed effect for chapter and book
+          chapter +
+          book +
+          # random intercept for class and student
+          (1 | class_id) +
+          (1 | student_id),
+        family = binomial(link = "logit"),
+        data = df.compare)
+
+```
+
+```{r}
+
+# summary
+lm.model1 %>%
+  summary()
+
+# p values
+lm.model1 %>%
+  joint_tests()
+
+# Calculate estimates
+lm.model1 %>%
+  ggpredict(bias_correction = T)
+
+```
+
+## RQ2: Does student engagement predict % correct?
+
+Including only number of attempts as an engagement predictor because the model does not
+converge using the other predictors.
+
+```{r}
+
+# quick check of correlation
+df.summary %>% 
+  select(score, chapter,
+         time_spent, no_attempts, chapter_pages_completed) %>% 
+  cor(use = "pairwise.complete.obs")
+
+# mixed effects model
+lm.model2 =
+  glmer(points_earned ~
+          1 +
+          # fixed effect for chapter, book
+          chapter +
+          book +
+          # fixed effects for student engagement variable (only attempt)
+          attempt +
+          # random intercept for class and student
+          (1 | class_id) +
+          (1 | student_id),
+        family = binomial(link = "logit"),
+        data = df.compare)
+
+```
+
+```{r}
+
+# summary
+lm.model2 %>%
+  summary()
+
+# p values
+lm.model2 %>%
+  joint_tests()
+
+# Calculate estimates
+lm.model2 %>%
+  ggpredict(bias_correction = T)
+
+```
+
+```{r}
+
+# plot
+plot.model2 =
+  lm.model2 %>%
+  ggpredict(terms = c("chapter [1:9]",  # x‑axis
+                      "attempt [1, 2, 5]",     # colour / linetype
+                      "book"),
+            ci_level = NA,
+            bias_correction = TRUE) |>
+  plot() +
+  ylim(0, 1) +
+  scale_x_continuous(limits = c(1, 9), breaks = 1:9) +
+  labs(
+    y        = "Predicted probability of earning point",
+    x        = "Chapter",
+    colour   = "Attempts",
+    title    = "Predicted probabilities from logistic mixed effects regression",
+    subtitle = "point_earned (1 or 0) ~ chapter + book + attempt"
+  ) +
+  theme(legend.position = "bottom")
+
+plot.model2
+
+# export plot
+ggsave((paste0(figures_dir,
+               "model_predictions.png")),
+       width = 15, height = 10, device = "png")
+
+```
+
+## RQ3: Does % correct on previous chapter predict % correct on current chapter?
+
+```{r}
+
+# quick check of correlation
+df.summary %>% 
+  select(score, score_prev_chapter) %>% 
+  cor(use = "pairwise.complete.obs")
+
+# mixed effects model
+lm.model3 =
+  glmer(points_earned ~
+          1 +
+          # fixed effect for chapter, book
+          chapter +
+          book +
+          # fixed effect for prev chapter score
+          score_prev_chapter +
+          # random intercept for class and student
+          (1 | class_id) +
+          (1 | student_id),
+        family = binomial(link = "logit"),
+        data = df.compare)
+
+```
+
+```{r}
+
+# summary
+lm.model3 %>%
+  summary()
+
+# p values
+lm.model3 %>%
+  joint_tests()
+
+# Calculate estimates
+lm.model3 %>%
+  ggpredict(bias_correction = T)
+
+```
+
+## Combined Model
+
+```{r}
+
+lm.model4 =
+  glmer(points_earned ~
+          1 +
+          # RQ1: fixed effect for chapter, book
+          chapter +
+          book +
+          # RQ2: fixed effect for student engagement (attempts)
+          attempt +
+          # RQ3: fixed effect for prev chapter score
+          score_prev_chapter +
+          prev_missing +
+          # random intercept for class and student
+          (1 | class_id) +
+          (1 | student_id),
+        family = binomial(link = "logit"),
+        data = df.compare)
+
+```
+
+```{r}
+
+# summary
+lm.model4 %>%
+  summary()
+
+# p values
+lm.model4 %>%
+  joint_tests()
+
+# Calculate estimates
+lm.model4 %>%
+  ggpredict(bias_correction = T)
+
+```
+
+### Comparison
+
+```{r}
+
+models = list(`Model 1` = lm.model1,
+              `Model 2` = lm.model2,
+              `Model 3` = lm.model3,
+              `Model 4 (Full)` = lm.model4)
+
+# compute AIC and BIC
+aic_bic =
+  performance::compare_performance(
+    models,
+    metrics = c("AIC", "BIC"),
+    rank = TRUE
+    ) %>%
+  select(Model = Name, AIC = AIC_wt, BIC = BIC_wt)
+
+# compute RMSE
+get_rmse =
+  function(model, data) {
+    pred = predict(model, newdata = data, type = "response",
+                   na.action = na.exclude)
+  ok = !is.na(pred) & !is.na(data$points_earned)
+  sqrt(mean((data$points_earned[ok] - pred[ok])^2))
+  }
+
+rmse_tbl =
+  tibble(Model = names(models),
+         RMSE  = map_dbl(models, get_rmse, data = df.compare)
+         )
+
+# merge
+df.metrics =
+  left_join(aic_bic, rmse_tbl, by = "Model") %>%
+  arrange(AIC) %>%
+  mutate(across(where(is.numeric), round, digits = 5))
+
+View(df.metrics)
+
+```
+
+# Predicting the Held-Out Data
+
+We have a held-out 20% of data that contains entirely new items. We now have the models
+above make predictions for that held-out dataset (predicting proportion correct for these
+new items).
+
+```{r}
+
+# # Import held out data
+# df.heldout =
+#   read.csv(paste0(data_dir, "filtered20_responses_2023.csv"))
+# 
+# df.heldout =
+#   df.heldout %>%
+#   group_by(book, release,
+#            institution_id, class_id,
+#            student_id,
+#            chapter_num,
+#            item_id) %>%
+#   # count only last attempt
+#   slice_max(order_by = attempt,
+#             n = 1,
+#             with_ties = F) %>% 
+#   ungroup() %>%
+#   # keep only relevant cols
+#   select(c(book, release,
+#            institution_id, class_id,
+#            student_id,
+#            chapter = chapter_num, item_id,
+#            points_possible, points_earned, attempt))
+# 
+# # compute engagement
+# df.summary_heldout =
+#   df.heldout %>%
+#   # group % correct by book, release, institution, class, student, and chapter
+#   group_by(book, release,
+#            institution_id, class_id, student_id,
+#            chapter) %>%
+#   # calculate % correct across chapter
+#   summarise(score = mean(points_earned, na.rm = T),
+#             # calculate average number of attempts across chapter
+#             no_attempts = mean(attempt, na.rm = T),
+#             .groups = "drop_last") %>%
+#   arrange(book, release,
+#           institution_id, class_id, student_id,
+#           chapter) %>% 
+#   group_by(book, release, institution_id, class_id, student_id) %>% 
+#   # add column for % correct on preceding chapter
+#   mutate(score_prev_chapter = lag(score)) %>%   # NA for the first chapter
+#   ungroup()
+# 
+# df.heldout =
+#   df.heldout %>% 
+#   left_join(df.summary_heldout %>% 
+#               select(student_id, chapter, score_prev_chapter),
+#             by = c("student_id", "chapter")) %>%
+#   select(points_earned, chapter, book,
+#          attempt, score_prev_chapter,
+#          class_id, student_id) %>%
+#   mutate(across(c(class_id, book, student_id),
+#                 factor)) %>%
+#   # create binary value marking missing values for prev chapter scores
+#   mutate(prev_missing = if_else(is.na(score_prev_chapter), 1, 0),
+#          # fill first chapter values with 0
+#          score_prev_chapter = replace_na(score_prev_chapter, 0)) %>%
+#   drop_na()
+
+```
+
+```{r}
+
+# # predict held out students
+# df.predict =
+#   df.heldout %>% 
+#   mutate(pred = predict(lm.model4, newdata = ., type = "response",
+#                         re.form = NA, # fixed‑effects only
+#                         allow.new.levels = TRUE))
+# 
+# # aggregate to one row per student
+# df.submit =
+#   df.predict %>% 
+#   group_by(id = student_id) %>% 
+#   summarise(score = mean(pred), .groups = "drop")
+# 
+# print(df.submit)
+
+```
